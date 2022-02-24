@@ -1,0 +1,108 @@
+variables:
+  GO_VERSION: "1.17"
+  GOLINT_VERSION: "1.40.0"
+  TF_VERSION: "0.14.6"
+  TF_MODULES_REPO: "https://dev.azure.com/skfdc/REP-SW/_git/terraform-modules"
+
+resources:
+  - repo: self
+    clean: "true"
+
+trigger:
+  - master
+
+pool:
+  name: Enlight
+  demands:
+    - sh
+    - ADO_AGENT_PREFIX -equals linux-build-agent-ci
+
+jobs:
+  - job: test
+    displayName: Test and Lint
+    steps:
+      - checkout: self
+        clean: "true"
+        persistCredentials: "true"
+
+      - task: GoTool@0
+        displayName: Install Go $(GO_VERSION)
+        inputs:
+          version: $(GO_VERSION)
+
+      - script: |
+          make openapi
+        displayName: build openapi models
+        workingDirectory: $(Build.SourcesDirectory)
+
+      - script: |
+          go install gotest.tools/gotestsum@v1.6.2
+
+          mkdir -p reports
+
+          go vet ./...
+          go test ./...
+        displayName: Run unit tests
+        workingDirectory: $(Build.SourcesDirectory)
+
+      - script: |
+          make build/testing
+        displayName: build behavior tests
+        workingDirectory: $(Build.SourcesDirectory)
+
+      - task: PublishBuildArtifacts@1
+        displayName: Publish test binary
+        inputs:
+          PathtoPublish: build/testing
+          ArtifactName: testing
+          publishLocation: Container
+
+      - script: |
+          echo "##[group]Install golangci-lint ${GOLINT_VERSION}"
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s v${GOLINT_VERSION}
+          LINTER=$(realpath ./bin/golangci-lint)
+          echo "##[endgroup]"
+
+          $LINTER version
+
+          FAILS=0
+          trap 'FAILS=$((FAILS+1))' ERR
+
+          echo "##[group]Linting backend"
+          $LINTER run --verbose ./...
+          echo "##[endgroup]"
+
+          echo "##[group]Linting testing/behavior"
+          cd testing/behavior
+          $LINTER run --verbose ./...
+          cd -
+          echo "##[endgroup]"
+
+          exit ${FAILS}
+        displayName: Linting
+
+  - job: release_artifact
+    displayName: Build Release Artifact
+    steps:
+      - checkout: self
+        clean: "true"
+        persistCredentials: "true"
+
+      - task: charleszipp.azure-pipelines-tasks-terraform.azure-pipelines-tasks-terraform-installer.TerraformInstaller@0
+        displayName: "Install Terraform $(TF_VERSION)"
+        inputs:
+          terraformVersion: $(TF_VERSION)
+
+      - script: |
+          git config --global http.$(TF_MODULES_REPO).extraHeader "Authorization: Bearer $(System.AccessToken)"
+        displayName: Prepare cloning external Terraform dependencies
+
+      - script: make build/release.tar.gz
+        displayName: Build
+
+      - task: PublishBuildArtifacts@1
+        displayName: Publish
+        inputs:
+          PathtoPublish: build/release.tar.gz
+          ArtifactName: release
+          publishLocation: Container
